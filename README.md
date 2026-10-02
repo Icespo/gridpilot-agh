@@ -2,8 +2,6 @@
 
 面向含光伏与储能配电网的滚动优化调度、安全校核和异常修复智能体原型。
 
-项目对应赛事方向：**B2 算法发现与组合优化 + B3 科学计算与仿真 + B4 科研 Agent 与 Harness 工程 + D4 环境能源与城市系统**。
-
 后续改进与版本路线见 [docs/PROJECT_IMPROVEMENT_ROADMAP.md](docs/PROJECT_IMPROVEMENT_ROADMAP.md)。
 
 ## 已实现能力
