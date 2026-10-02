@@ -88,6 +88,11 @@ def _solve_window(
     for index, site in enumerate(pv_sites):
         pv_sites_by_bus[site["bus"]].append(index)
     total_pv_capacity = sum(site["capacity_kw"] for site in pv_sites)
+    reactive_support_by_bus = {
+        int(device["bus"]): float(device["capacity_kvar"])
+        for device in case.get("reactive_support", [])
+    }
+    source_voltage_sq = float(case.get("source_voltage_pu", 1.0)) ** 2
 
     variables = _Variables()
     grid = variables.add("grid", (hours,))
@@ -172,7 +177,7 @@ def _solve_window(
             objective[shed[hour, bus_index]] = 15.0
             bounds[shed[hour, bus_index]] = (0.0, float(load_p))
             if bus_row["bus"] == 1:
-                bounds[voltage_sq[hour, bus_index]] = (1.0, 1.0)
+                bounds[voltage_sq[hour, bus_index]] = (source_voltage_sq, source_voltage_sq)
             else:
                 bounds[voltage_sq[hour, bus_index]] = (v_min, v_max)
 
@@ -198,7 +203,11 @@ def _solve_window(
         for bus_index, bus_row in enumerate(case["buses"]):
             bus = bus_row["bus"]
             load_p = bus_row["p_kw"] * load_scale[hour]
-            load_q = bus_row["q_kvar"] * load_scale[hour]
+            svg_q = min(
+                reactive_support_by_bus.get(bus, 0.0),
+                reactive_support_by_bus.get(bus, 0.0) * max(float(load_scale[hour]), 0.0) ** 2,
+            )
+            load_q = bus_row["q_kvar"] * load_scale[hour] - svg_q
             active: dict[int, float] = {shed[hour, bus_index]: 1.0}
             reactive: dict[int, float] = {}
             if bus == 1:
@@ -303,11 +312,15 @@ def _solve_window(
 
         for bus_index, bus in enumerate(buses):
             bounds[v_security[bus_index]] = (
-                (1.0, 1.0) if bus == 1 else (security_voltage_floor, v_max)
+                (source_voltage_sq, source_voltage_sq) if bus == 1 else (security_voltage_floor, v_max)
             )
             bus_row = case["buses"][bus_index]
             load_p = bus_row["p_kw"] * load_scale[hour]
-            load_q = bus_row["q_kvar"] * load_scale[hour]
+            svg_q = min(
+                reactive_support_by_bus.get(bus, 0.0),
+                reactive_support_by_bus.get(bus, 0.0) * max(float(load_scale[hour]), 0.0) ** 2,
+            )
+            load_q = bus_row["q_kvar"] * load_scale[hour] - svg_q
             dr_limit = max(load_p * demand_response_fraction, 0.0)
             bounds[demand_response[bus_index]] = (0.0, dr_limit)
             objective[demand_response[bus_index]] = 8.0

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .data import LOAD_PROFILE, PRICE, PV_PROFILE, load_case, scenario_config, validate_case
+from .data import LOAD_PROFILE, PRICE, PV_PROFILE, apply_scenario_investments, load_case, scenario_config, validate_case
 from .optimizer import BatteryConfig, optimize_rolling_dispatch
 from .pandapower_validation import run_line_n_1_assessment, validate_schedule_with_pandapower
 from .security import build_topology_visualization, enrich_n_1_records, generate_n_1_security_constraints
@@ -79,7 +79,7 @@ def _metrics(schedule: list[dict], checks: list[dict], objective: float, baselin
 def run_closed_loop(scenario: str = "normal", max_repairs: int = 4, include_n_1: bool = True) -> dict:
     trace: list[dict] = []
     _trace(trace, "task_received", "ok", f"收到 {scenario} 场景的光储调度与安全校核任务")
-    case = load_case()
+    case = apply_scenario_investments(load_case(), scenario)
     errors = validate_case(case)
     if errors:
         _trace(trace, "data_validation", "error", "; ".join(errors))
@@ -87,6 +87,13 @@ def run_closed_loop(scenario: str = "normal", max_repairs: int = 4, include_n_1:
     _trace(trace, "data_validation", "ok", "33 个节点、32 条径向支路及设备上下限检查通过")
 
     cfg = scenario_config(scenario)
+    if cfg.get("investment_plan"):
+        _trace(
+            trace,
+            "investment_commissioning",
+            "ok",
+            "规划建设资产已投运：2条远端独立备用馈线、12段走廊增容、3组SVG及主变OLTC。",
+        )
     total_base_load = sum(row["p_kw"] for row in case["buses"])
     pv_capacity = sum(site["capacity_kw"] for site in case["pv_sites"])
     load = total_base_load * LOAD_PROFILE * cfg["load_multiplier"]
@@ -387,6 +394,7 @@ def run_closed_loop(scenario: str = "normal", max_repairs: int = 4, include_n_1:
         "n_1": n_1,
         "security_constraint_generation": security_generation,
         "trace": trace,
+        "investment_plan": case.get("investment_plan"),
         "assumptions": [
             "单时段长度为 1 小时，光伏无功设为 0。",
             "调度层使用12小时滚动时域LinDistFlow网络约束优化，每小时仅执行窗口首个控制量。",

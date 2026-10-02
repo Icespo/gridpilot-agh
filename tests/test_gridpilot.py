@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from gridpilot.data import load_case, validate_case
+from gridpilot.data import apply_scenario_investments, load_case, validate_case
 from gridpilot.engine import run_closed_loop
 from gridpilot.webapp import LANDING, load_saved_result
 from gridpilot.uncertainty import analyze_uncertainty
@@ -11,6 +11,7 @@ from gridpilot.uncertainty import analyze_uncertainty
 class GridPilotTests(unittest.TestCase):
     def test_case_is_valid(self) -> None:
         self.assertEqual(validate_case(load_case()), [])
+        self.assertEqual(validate_case(apply_scenario_investments(load_case(), "post_investment")), [])
 
     def test_normal_scenario_has_complete_schedule(self) -> None:
         result = run_closed_loop("normal")
@@ -71,6 +72,22 @@ class GridPilotTests(unittest.TestCase):
         self.assertIn("N-1 安全校核", LANDING)
         self.assertIn("N-1 风险热力图", LANDING)
         self.assertIn("故障拓扑与联络恢复", LANDING)
+        self.assertIn("投资建设后", LANDING)
+        self.assertIn("投资建设方案与投运效果", LANDING)
+
+    def test_post_investment_result_has_physical_assets_and_full_n_1(self) -> None:
+        result = load_saved_result("post_investment")
+        self.assertEqual(result["n_1"]["contingencies_evaluated"], 24 * 32)
+        self.assertGreaterEqual(result["n_1"]["security_rate_pct"], 95.0)
+        self.assertEqual(len(result["n_1"]["topology"]["backup_feeders"]), 3)
+        self.assertEqual(sum(row["reactive_support"] for row in result["n_1"]["topology"]["nodes"]), 3)
+        self.assertGreater(sum(row["investment_upgraded"] for row in result["n_1"]["topology"]["lines"]), 0)
+        self.assertEqual(len(result["investment_plan"]["assets"]), 5)
+        self.assertIn("investment_comparison", result)
+        self.assertGreater(
+            result["investment_comparison"]["after_security_rate_pct"],
+            result["investment_comparison"]["before_security_rate_pct"],
+        )
 
     def test_web_demo_rejects_unknown_scenario(self) -> None:
         with self.assertRaises(ValueError):
@@ -84,8 +101,18 @@ class GridPilotTests(unittest.TestCase):
         self.assertEqual({item["key"] for item in analysis["methods"]}, {"deterministic", "stochastic", "robust"})
         self.assertTrue(all(item["cvar_yuan"] >= item["expected_cost_yuan"] for item in analysis["methods"]))
         self.assertIn(analysis["selected_method"], {"deterministic", "stochastic", "robust"})
+        evidence = analysis["optimization_evidence"]
+        self.assertEqual(evidence["formulation"], "two-stage deterministic-equivalent linear program")
+        self.assertEqual(evidence["scenario_count"], 20)
+        self.assertGreater(evidence["implicit_nonanticipativity_links"], 0)
+        self.assertTrue(all(len(item["first_stage_grid_kw"]) == 24 for item in analysis["methods"]))
+        self.assertTrue(all(len(item["scenario_costs_yuan"]) == 20 for item in analysis["methods"]))
         self.assertIn("预测不确定性输入", LANDING)
         self.assertIn("净负荷概率扇形图", LANDING)
+
+    def test_battery_outage_stochastic_model_has_no_storage_reserve(self) -> None:
+        analysis = analyze_uncertainty(load_saved_result("battery_outage"))
+        self.assertTrue(all(item["peak_reserve_kw"] < 1e-9 for item in analysis["methods"]))
 
 
 if __name__ == "__main__":

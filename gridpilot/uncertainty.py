@@ -4,6 +4,8 @@ from statistics import NormalDist
 
 import numpy as np
 
+from .stochastic import solve_two_stage_methods
+
 
 DEFAULTS = {
     "normal": {
@@ -33,6 +35,13 @@ DEFAULTS = {
         "price_error_pct": 14.0,
         "risk_aversion": 0.88,
         "reason": "主干线路降额时安全裕度较小，采用更保守的风险参数。",
+    },
+    "post_investment": {
+        "pv_error_pct": 18.0,
+        "load_error_pct": 7.0,
+        "price_error_pct": 10.0,
+        "risk_aversion": 0.40,
+        "reason": "建设后网架和无功裕度增加，保留与正常场景一致的预测误差以公平比较投资效果。",
     },
 }
 
@@ -120,104 +129,6 @@ def _generate_scenarios(result: dict, params: dict) -> dict:
     }
 
 
-def _tail_mean(values: np.ndarray, confidence: float) -> float:
-    threshold = float(np.quantile(values, confidence, method="higher"))
-    tail = values[values >= threshold - 1e-9]
-    return float(np.mean(tail))
-
-
-def _evaluate_reserve_policy(result: dict, scenarios: dict, reserve: np.ndarray, confidence: float) -> dict:
-    schedule = result["schedule"]
-    base_cost = float(result["metrics"]["operating_cost_yuan"])
-    base_grid = np.array([row["grid_kw"] for row in schedule], dtype=float)
-    grid_limit = np.array([row["grid_limit_kw"] for row in schedule], dtype=float)
-    base_voltage = np.array(
-        [item["min_voltage_pu"] for item in sorted(result["power_flow"], key=lambda row: row["hour"])],
-        dtype=float,
-    )
-    base_loading = np.array(
-        [item["max_line_loading_pct"] for item in sorted(result["power_flow"], key=lambda row: row["hour"])],
-        dtype=float,
-    )
-    deviations = scenarios["deviations"]
-    price = scenarios["price"]
-    grid_headroom = np.maximum(grid_limit - base_grid, 0.0)
-    positive = np.maximum(deviations, 0.0)
-    negative = np.maximum(-deviations, 0.0)
-    # Reserve represents local corrective power from storage, demand response or flexible generation.
-    local_response = np.minimum(positive, reserve[None, :])
-    remaining = positive - local_response
-    grid_response = np.minimum(remaining, grid_headroom[None, :])
-    unserved = np.maximum(remaining - grid_response, 0.0)
-    downward_grid = np.minimum(negative, base_grid[None, :])
-    reserve_capacity_cost = 0.065 * float(np.sum(reserve))
-    scenario_costs = (
-        base_cost
-        + reserve_capacity_cost
-        + np.sum(local_response * price * 1.15, axis=1)
-        + np.sum(grid_response * price, axis=1)
-        - np.sum(downward_grid * price * 0.65, axis=1)
-        + np.sum(unserved, axis=1) * 15.0
-    )
-    voltage = base_voltage[None, :] - remaining * 0.000030 + local_response * 0.000010
-    loading = base_loading[None, :] + remaining * 0.018
-    loss_events = np.sum(unserved, axis=1) > 0.1
-    voltage_events = np.any(voltage < 0.95, axis=1)
-    network_events = np.any((voltage < 0.95) | (loading > 100.0), axis=1)
-    return {
-        "costs": scenario_costs,
-        "expected_cost_yuan": float(np.mean(scenario_costs)),
-        "cvar_yuan": _tail_mean(scenario_costs, confidence),
-        "loss_of_load_probability_pct": 100.0 * float(np.mean(loss_events)),
-        "voltage_violation_probability_pct": 100.0 * float(np.mean(voltage_events)),
-        "network_violation_probability_pct": 100.0 * float(np.mean(network_events)),
-        "expected_unserved_energy_kwh": float(np.mean(np.sum(unserved, axis=1))),
-        "reserve_energy_kwh": float(np.sum(reserve)),
-        "peak_reserve_kw": float(np.max(reserve)),
-        "worst_scenario": int(np.argmax(scenario_costs)) + 1,
-    }
-
-
-def _method_comparison(result: dict, scenarios: dict, params: dict) -> list[dict]:
-    confidence = params["confidence_pct"] / 100.0
-    positive = np.maximum(scenarios["deviations"], 0.0)
-    deterministic_reserve = np.zeros(positive.shape[1])
-    stochastic_envelope = np.quantile(positive, 0.90, axis=0)
-    robust_reserve = np.max(positive, axis=0)
-
-    deterministic = _evaluate_reserve_policy(result, scenarios, deterministic_reserve, confidence)
-    deterministic.update({"key": "deterministic", "label": "确定性调度", "reserve_factor": 0.0})
-
-    candidates: list[tuple[float, dict]] = []
-    for factor in np.linspace(0.25, 1.0, 7):
-        evaluated = _evaluate_reserve_policy(result, scenarios, stochastic_envelope * factor, confidence)
-        risk_objective = (
-            (1.0 - params["risk_aversion"]) * evaluated["expected_cost_yuan"]
-            + params["risk_aversion"] * evaluated["cvar_yuan"]
-            + 12.0 * evaluated["network_violation_probability_pct"]
-            + 45.0 * evaluated["loss_of_load_probability_pct"]
-        )
-        candidates.append((risk_objective, {**evaluated, "reserve_factor": float(factor)}))
-    stochastic = min(candidates, key=lambda item: item[0])[1]
-    stochastic.update({"key": "stochastic", "label": "两阶段随机优化"})
-
-    robust = _evaluate_reserve_policy(result, scenarios, robust_reserve, confidence)
-    robust.update({"key": "robust", "label": "鲁棒优化", "reserve_factor": 1.0})
-
-    methods = [deterministic, stochastic, robust]
-    for method in methods:
-        method["expected_cost_yuan"] = round(method["expected_cost_yuan"], 2)
-        method["cvar_yuan"] = round(method["cvar_yuan"], 2)
-        method["loss_of_load_probability_pct"] = round(method["loss_of_load_probability_pct"], 2)
-        method["voltage_violation_probability_pct"] = round(method["voltage_violation_probability_pct"], 2)
-        method["network_violation_probability_pct"] = round(method["network_violation_probability_pct"], 2)
-        method["expected_unserved_energy_kwh"] = round(method["expected_unserved_energy_kwh"], 3)
-        method["reserve_energy_kwh"] = round(method["reserve_energy_kwh"], 2)
-        method["peak_reserve_kw"] = round(method["peak_reserve_kw"], 2)
-        method.pop("costs", None)
-    return methods
-
-
 def _histogram(values: np.ndarray, bins: int = 12) -> dict:
     counts, edges = np.histogram(values, bins=bins)
     centers = (edges[:-1] + edges[1:]) / 2.0
@@ -231,14 +142,12 @@ def analyze_uncertainty(result: dict, supplied_parameters: dict | None = None) -
     low_q = (1.0 - confidence) / 2.0
     high_q = 1.0 - low_q
     net = generated["net_load"]
-    methods = _method_comparison(result, generated, params)
+    methods, optimization_evidence = solve_two_stage_methods(result, generated, params)
     selected = min(
         methods,
         key=lambda item: (
             (1.0 - params["risk_aversion"]) * item["expected_cost_yuan"]
             + params["risk_aversion"] * item["cvar_yuan"]
-            + 12.0 * item["network_violation_probability_pct"]
-            + 45.0 * item["loss_of_load_probability_pct"]
         ),
     )
     empirical_correlation = np.corrcoef(generated["errors"].reshape(-1, 3), rowvar=False)
@@ -250,6 +159,7 @@ def analyze_uncertainty(result: dict, supplied_parameters: dict | None = None) -
         "selected_method": selected["key"],
         "selected_method_label": selected["label"],
         "methods": methods,
+        "optimization_evidence": optimization_evidence,
         "hours": list(range(len(result["schedule"]))),
         "fan_chart": {
             "base": (generated["base_load"] - generated["base_pv"]).round(3).tolist(),

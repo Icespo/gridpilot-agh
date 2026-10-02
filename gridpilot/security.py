@@ -157,6 +157,13 @@ def parse_edge_name(name: str) -> tuple[int, int]:
     return int(left), int(right)
 
 
+def _backup_feeders(case: dict) -> list[dict]:
+    feeders = case.get("backup_feeders")
+    if feeders:
+        return list(feeders)
+    return [case["backup_feeder"]] if case.get("backup_feeder") else []
+
+
 def contingency_tree(case: dict, outage_line: str, restoration_tie: str) -> list[dict]:
     """Build and orient the restored radial topology from the source bus."""
     outage = parse_edge_name(outage_line)
@@ -167,7 +174,13 @@ def contingency_tree(case: dict, outage_line: str, restoration_tie: str) -> list
             continue
         raw_edges.append({**line, "name": f"L{line['from']}-{line['to']}", "kind": "base"})
     if restoration_tie.startswith("B"):
-        backup = case.get("backup_feeder")
+        backup = next(
+            (
+                item for item in _backup_feeders(case)
+                if item.get("name", f"B{item['from']}-{item['to']}") == restoration_tie
+            ),
+            None,
+        )
         if not backup or {backup["from"], backup["to"]} != {restoration[0], restoration[1]}:
             raise ValueError(f"找不到备用馈线：{restoration_tie}")
         raw_edges.append({**backup, "name": backup.get("name", restoration_tie), "kind": "backup"})
@@ -224,18 +237,43 @@ def build_topology_visualization(case: dict) -> dict:
         for row in case["buses"]
     ]
     lines = [
-        {"name": f"L{line['from']}-{line['to']}", "from": line["from"], "to": line["to"]}
+        {
+            "name": f"L{line['from']}-{line['to']}",
+            "from": line["from"],
+            "to": line["to"],
+            "investment_upgraded": bool(line.get("investment_upgraded", False)),
+        }
         for line in case["lines"]
     ]
     ties = [
-        {"name": f"T{line['from']}-{line['to']}", "from": line["from"], "to": line["to"]}
+        {
+            "name": f"T{line['from']}-{line['to']}",
+            "from": line["from"],
+            "to": line["to"],
+            "investment_upgraded": bool(line.get("investment_upgraded", False)),
+        }
         for line in case.get("tie_lines", [])
     ]
-    backup = case.get("backup_feeder")
-    backups = [] if not backup else [{
-        "name": backup.get("name", f"B{backup['from']}-{backup['to']}"),
-        "from": backup["from"],
-        "to": backup["to"],
-        "description": backup.get("description", "独立备用馈线"),
-    }]
-    return {"width": 940, "height": 450, "nodes": nodes, "lines": lines, "ties": ties, "backup_feeders": backups}
+    backups = [
+        {
+            "name": backup.get("name", f"B{backup['from']}-{backup['to']}"),
+            "from": backup["from"],
+            "to": backup["to"],
+            "description": backup.get("description", "独立备用馈线"),
+            "investment_new": bool(backup.get("investment_new", False)),
+        }
+        for backup in _backup_feeders(case)
+    ]
+    reactive_buses = {int(item["bus"]) for item in case.get("reactive_support", [])}
+    for node in nodes:
+        node["reactive_support"] = int(node["bus"]) in reactive_buses
+    return {
+        "width": 940,
+        "height": 520 if len(backups) > 1 else 450,
+        "nodes": nodes,
+        "lines": lines,
+        "ties": ties,
+        "backup_feeders": backups,
+        "investment_mode": bool(case.get("investment_plan")),
+        "source_voltage_pu": float(case.get("source_voltage_pu", 1.0)),
+    }

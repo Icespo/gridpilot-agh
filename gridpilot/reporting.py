@@ -45,6 +45,21 @@ def render_html(result: dict) -> str:
     )
     n_1_card = ""
     n_1_section = ""
+    investment_section = ""
+    plan = result.get("investment_plan")
+    if plan:
+        asset_rows = "".join(
+            f"<tr><td>{html.escape(item['id'])}</td><td>{html.escape(item['name'])}</td>"
+            f"<td>{html.escape(item['location'])}</td><td>{html.escape(item['capacity'])}</td>"
+            f"<td>{item['capex_wanyuan']:.0f}</td><td>{html.escape(item['purpose'])}</td></tr>"
+            for item in plan.get("assets", [])
+        )
+        investment_section = f"""
+<h2>投资建设方案</h2><div class="panel">
+<p><strong>{html.escape(plan['name'])}</strong>：总投资 {plan['total_capex_wanyuan']:.0f} 万元，规划期 {plan['planning_horizon_years']} 年，年化投资 {plan['annualized_cost_wanyuan']:.0f} 万元。</p>
+<p>安全阈值保持0.95–1.05 pu与线路负载率不超过100%，建设后重新执行基态AC潮流和全部768个N-1工况。</p>
+<div class="scroll"><table><thead><tr><th>编号</th><th>资产</th><th>位置</th><th>规模</th><th>投资/万元</th><th>作用</th></tr></thead><tbody>{asset_rows}</tbody></table></div>
+</div>"""
     if n_1 is not None:
         n_1_card = f'<div class="card"><div class="label">N-1高风险工况</div><div class="value">{n_1["failed_contingencies"]}/{n_1["contingencies_evaluated"]}</div></div>'
         critical_rows = "".join(
@@ -84,6 +99,7 @@ h1{{margin:0 0 8px;font-size:34px}} h2{{margin:32px 0 14px;font-size:22px}} .sub
 {n_1_card}
 </section>
 <h2>结论</h2><div class="panel"><strong>{html.escape(result['conclusion'])}</strong><p>{html.escape(result['scenario_description'])}</p></div>
+{investment_section}
 <h2>运行曲线</h2><section class="charts"><div class="panel"><div class="label">电网购电功率 / kW</div>{grid_chart}</div><div class="panel"><div class="label">储能 SOC / %</div>{soc_chart}</div></section>
 <h2>Agent 执行轨迹</h2><div class="panel"><table><thead><tr><th>步骤</th><th>状态</th><th>证据</th></tr></thead><tbody>{trace_rows}</tbody></table></div>
 {n_1_section}

@@ -23,6 +23,13 @@ def _bus_injections(case: dict, load_scale: float, row: dict) -> tuple[dict[int,
     return p_load, q_load, shed_by_bus
 
 
+def _backup_feeders(case: dict) -> list[dict]:
+    feeders = case.get("backup_feeders")
+    if feeders:
+        return list(feeders)
+    return [case["backup_feeder"]] if case.get("backup_feeder") else []
+
+
 def build_pandapower_network(
     case: dict,
     load_scale: float,
@@ -42,7 +49,12 @@ def build_pandapower_network(
         )
         bus_map[entry["bus"]] = bus_index
         reverse_bus_map[bus_index] = entry["bus"]
-    pp.create_ext_grid(net, bus=bus_map[1], vm_pu=1.0, name="Upstream grid")
+    pp.create_ext_grid(
+        net,
+        bus=bus_map[1],
+        vm_pu=float(case.get("source_voltage_pu", 1.0)),
+        name="Upstream grid",
+    )
 
     base_line_indices: list[int] = []
     for line in case["lines"]:
@@ -79,9 +91,8 @@ def build_pandapower_network(
         tie_line_indices.append(line_index)
         restoration_candidates.append({"index": line_index, "from": tie["from"], "to": tie["to"], "type": "tie_line"})
 
-    backup_line_index = None
-    backup = case.get("backup_feeder")
-    if backup:
+    backup_line_indices: list[int] = []
+    for backup in _backup_feeders(case):
         backup_line_index = pp.create_line_from_parameters(
             net,
             from_bus=bus_map[backup["from"]],
@@ -94,12 +105,15 @@ def build_pandapower_network(
             name=backup.get("name", f"B{backup['from']}-{backup['to']}"),
             in_service=not backup.get("normally_open", True),
         )
+        backup_line_indices.append(backup_line_index)
         restoration_candidates.append(
             {
                 "index": backup_line_index,
                 "from": backup["from"],
                 "to": backup["to"],
                 "type": "backup_feeder",
+                "switching_time_minutes": int(backup.get("switching_time_minutes", 10)),
+                "physical_repair_hours": int(backup.get("physical_repair_hours", 3)),
             }
         )
 
@@ -124,6 +138,22 @@ def build_pandapower_network(
     for bus_text, value in pv_by_bus.items():
         pp.create_sgen(net, bus=bus_map[int(bus_text)], p_mw=float(value) / 1000.0, q_mvar=0.0, name=f"PV {bus_text}")
 
+    # Commissioned SVGs use a conservative Volt-VAR proxy proportional to the
+    # current load level.  The rating is a hard ceiling; the N-1 AC assessment
+    # therefore receives real reactive injection rather than a display-only flag.
+    for device in case.get("reactive_support", []):
+        q_kvar = min(
+            float(device["capacity_kvar"]),
+            float(device["capacity_kvar"]) * max(load_scale, 0.0) ** 2,
+        )
+        pp.create_sgen(
+            net,
+            bus=bus_map[int(device["bus"])],
+            p_mw=0.0,
+            q_mvar=q_kvar / 1000.0,
+            name=str(device.get("name", f"SVG-{device['bus']}")),
+        )
+
     battery_bus = case["battery"]["bus"]
     pp.create_sgen(
         net,
@@ -138,7 +168,7 @@ def build_pandapower_network(
         "reverse_bus_map": reverse_bus_map,
         "base_line_indices": base_line_indices,
         "tie_line_indices": tie_line_indices,
-        "backup_line_index": backup_line_index,
+        "backup_line_indices": backup_line_indices,
         "restoration_candidates": restoration_candidates,
         "gross_served_load_kw": p_load,
         "shed_by_bus_kw": shed_by_bus,
@@ -304,6 +334,7 @@ def run_line_n_1_assessment(
             candidates: list[tuple[str | None, dict]] = []
             eligible_restorations = _eligible_restoration_candidates(case, metadata, outage_position)
             candidate_types: dict[str | None, str] = {None: "none"}
+            candidate_settings: dict[str, dict] = {}
             for restoration in [None, *eligible_restorations]:
                 net = copy.deepcopy(base_net)
                 net.line.at[outage_index, "in_service"] = False
@@ -313,13 +344,15 @@ def run_line_n_1_assessment(
                     net.line.at[line_index, "in_service"] = True
                     tie_name = str(net.line.at[line_index, "name"])
                     candidate_types[tie_name] = str(restoration["type"])
+                    candidate_settings[tie_name] = restoration
                 result = _evaluate_network(net, metadata, case)
                 power_flow_runs += 1
                 candidates.append((tie_name, result))
             before_restoration = candidates[0][1]
             tie_name, best = min(candidates, key=lambda item: _contingency_score(item[1], case))
             restoration_type = candidate_types.get(tie_name, "none")
-            backup = case.get("backup_feeder", {})
+            chosen_settings = candidate_settings.get(tie_name, {})
+            default_backup = _backup_feeders(case)[0] if _backup_feeders(case) else {}
             secure = bool(
                 best["converged"]
                 and best["unserved_load_kw"] < 1e-6
@@ -333,12 +366,12 @@ def run_line_n_1_assessment(
                 "restoration_tie": tie_name,
                 "restoration_type": restoration_type,
                 "switching_time_minutes": (
-                    int(backup.get("switching_time_minutes", 10))
+                    int(chosen_settings.get("switching_time_minutes", 10))
                     if restoration_type == "backup_feeder"
                     else 5 if restoration_type == "tie_line" else None
                 ),
-                "physical_repair_hours": int(backup.get("physical_repair_hours", 3)),
-                "repair_completion_hour": (hour + int(backup.get("physical_repair_hours", 3))) % 24,
+                "physical_repair_hours": int(chosen_settings.get("physical_repair_hours", default_backup.get("physical_repair_hours", 3))),
+                "repair_completion_hour": (hour + int(chosen_settings.get("physical_repair_hours", default_backup.get("physical_repair_hours", 3)))) % 24,
                 "secure": secure,
                 "converged": best["converged"],
                 "unserved_load_kw": round(best["unserved_load_kw"], 3),
@@ -372,8 +405,8 @@ def run_line_n_1_assessment(
         "repair_policy": {
             "fault_isolation_minutes": 1,
             "tie_switching_minutes": 5,
-            "backup_feeder_switching_minutes": int(case.get("backup_feeder", {}).get("switching_time_minutes", 10)),
-            "assumed_physical_repair_hours": int(case.get("backup_feeder", {}).get("physical_repair_hours", 3)),
+            "backup_feeder_switching_minutes": min((int(item.get("switching_time_minutes", 10)) for item in _backup_feeders(case)), default=10),
+            "assumed_physical_repair_hours": min((int(item.get("physical_repair_hours", 3)) for item in _backup_feeders(case)), default=3),
             "interpretation": "N-1为逐时假想故障；开关恢复按分钟级，物理抢修按可配置的3小时演示假设。",
         },
         "secure_contingencies": len(records) - len(failed),
